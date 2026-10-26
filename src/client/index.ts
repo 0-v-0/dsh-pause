@@ -16,8 +16,8 @@ import { PauseControl } from './PauseBar.tsx'
 
 /** 插件名即配置项 id。 */
 export const name = 'dsh-pause'
-/** 本插件需要的客户端服务。conversation 用于把草稿附件序列化成可随插话提交的载荷。 */
-export const inject = ['slots', 'connection', 'conversation']
+/** 本插件需要的客户端服务。conversation 用于把草稿附件序列化成可随插话提交的载荷；remote 用于订阅 host 经 $events 推送的 pause/status。 */
+export const inject = ['slots', 'connection', 'conversation', 'remote']
 
 /** 注册时注入读条组件、按钮所需的业务面。 */
 export interface PauseBarInjected {
@@ -25,6 +25,10 @@ export interface PauseBarInjected {
   readonly rpc: ClientConnectionRpc
   /** 把草稿附件序列化成图片 base64 或文件 receipt；图片在主机侧持久化后随插话发出。 */
   readonly serializeAttachments: (ids: readonly DraftAttachmentId[]) => Promise<readonly SubmitAttachment[]>
+  /** host 经 $events 推送的事件订阅；缺失或订阅不生效时组件自动回退轮询。 */
+  readonly remote?: {
+    $on(event: string, listener: (payload: unknown) => void): () => void
+  }
 }
 
 /**
@@ -34,6 +38,7 @@ export interface PauseBarInjected {
 export function apply(ctx: ClientContext): void {
   const connection = (ctx as unknown as { connection: ConnectionHandle }).connection
   const conversation = (ctx as unknown as { conversation: ConversationController }).conversation
+  const remote = (ctx as unknown as { remote?: PauseBarInjected['remote'] }).remote
   ctx.slots.inject('conversation.input.right', () =>
     ctx.slots.register(
       {
@@ -49,6 +54,7 @@ export function apply(ctx: ClientContext): void {
             }
             return (await conversation.serializeDraftAttachments(ids)).attachments
           },
+          remote,
         }),
       },
       PauseControl,

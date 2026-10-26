@@ -6,7 +6,19 @@
  * - 暂停时在 host 报 paused 的状态下于 composer 主输入框按裸 Enter 即继续。草稿为空则无感放行，草稿有字则作为插话放行并清空草稿。
  * - 未暂停时不拦截任何按键，完全透明。
  *
- * dsh 的 composer Enter 由 InputBar 私有 keymap 处理，第三方没有正式 hook 点，故本组件在暂停态对所属 composer 挂 document 级 capture-phase keydown，抢在 Lexical 之前拦截裸 Enter。
+ * 状态同步（两层，自动降级）：
+ * 1. 推送：host 经 $events 通道转发 pause/status（allowlist 由本插件在模块求值
+ *    阶段注入，见 forwarded-events）。收到任意帧即确认链路存活（握手窗口 4s），
+ *    paused/enabled 即时更新，零轮询。
+ *    推送走 WebSocket，不占 HTTP 并发连接，也不在 DevTools 请求列表留记录。
+ * 2. 回退：注入失败时降级为轮询，间隔按 enabled 分档（见 ARMED_POLL_MS）。
+ *
+ * 拦截只在 host 明确报 paused 时挂载。未暂停时不碰任何按键，Enter 全走官方
+ * keymap——不代用户提交，因为 InputActions.submit() 在官方实现里写死
+ * submit('queue')，会覆盖用户配置的 busyEnter=steer。
+ *
+ * dsh 的 composer Enter 由 InputBar 私有 keymap 处理，第三方没有正式 hook 点，
+ * 故本组件在暂停态对所属 composer 挂 document 级 capture-phase keydown，抢在 Lexical 之前拦截裸 Enter。
  *
  * @module dsh-pause/client
  */
@@ -23,6 +35,10 @@ export interface PauseBarInjected {
   }
   /** 把草稿附件序列化成可随插话提交的载荷。 */
   readonly serializeAttachments?: (ids: readonly DraftAttachmentId[]) => Promise<readonly SubmitAttachment[]>
+  /** host 经 $events 推送的事件订阅；缺失或链路未握手成功时自动回退轮询。 */
+  readonly remote?: {
+    $on(event: string, listener: (payload: unknown) => void): () => void
+  }
 }
 
 /** conversation.input.right 的 session 作用域组件收到的标准 props + 注入面。 */
@@ -40,6 +56,31 @@ interface PauseStatus {
   enabled?: boolean
   paused?: boolean
 }
+
+/** 推送帧形状（与 host 端 emit 一致）。 */
+interface PausePushPayload {
+  sessionId?: unknown
+  enabled?: unknown
+  paused?: unknown
+}
+
+/** 推送链路握手窗口：此时间内收到任意 pause/status 帧即确认注入成功。 */
+const PUSH_HANDSHAKE_MS = 4000
+/**
+ * 回退轮询间隔（推送不可用时）。
+ *
+ * 间隔按「此刻会不会有盲窗」分档，而不是全程用最短间隔：
+ * - 开关关着（`enabled === false`）：不可能拉门，也就没有盲窗可言，
+ *   只需慢速探到「别的客户端打开了开关」，故用 {@link IDLE_POLL_MS}。
+ * - 开关开着（`enabled === true`）：随时可能进入 paused，盲窗宽度直接由
+ *   间隔决定，故用 {@link ARMED_POLL_MS}。
+ * - 已经 paused 时没有额外收益：门已在等按键，慢一点也只是延后「门被别处
+ *   放行」的显示，保持 ARMED 档即可。
+ *
+ * 空闲会话的请求量因此降一个数量级，而开关开着时的盲窗宽度不受影响。
+ */
+const ARMED_POLL_MS = 400
+const IDLE_POLL_MS = 5000
 
 async function fetchStatus(rpc: PauseBarInjected['rpc'], sessionId: string): Promise<PauseStatus | undefined> {
   try {
@@ -77,7 +118,7 @@ async function callSetEnabled(rpc: PauseBarInjected['rpc'], sessionId: string, e
   try {
     await rpc.call('/dsh-pause', 'setEnabled', { sessionId, enabled })
   } catch {
-    // 忽略：失败时本地开关不落定，下次轮询会回正
+    // 忽略：失败时本地开关不落定，下次轮询/推送会回正
   }
 }
 
@@ -141,7 +182,7 @@ function PauseIcon(): ReactElement {
 }
 
 /**
- * 暂停控件。暂停态挂 document capture 拦截裸 Enter，落点在本 composer 卡内时改为放行。
+ * 暂停控件。只在 host 报 paused 时挂 document capture 拦截裸 Enter 改走放行；未暂停不碰按键。
  */
 export const PauseControl = memo(function PauseControl({
   rpc,
@@ -149,10 +190,13 @@ export const PauseControl = memo(function PauseControl({
   useInput,
   inputActions,
   serializeAttachments,
+  remote,
 }: PauseControlProps) {
   const [enabled, setEnabled] = useState(false)
   const [paused, setPaused] = useState(false)
   const [error, setError] = useState<string | undefined>(undefined)
+  /** null=握手未定（轮询兜底）；true=推送链路存活（零轮询）；false=链路失败（回退轮询）。 */
+  const [pushLive, setPushLive] = useState<boolean | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
 
   // render 内 subscribe：草稿与附件变化会触发本组件重渲染并更新 ref。
@@ -163,12 +207,11 @@ export const PauseControl = memo(function PauseControl({
   draftRef.current = draft
   const idsRef = useRef(attachmentIds)
   idsRef.current = attachmentIds
-  // capture 处理器要读最新 paused/rpc/sessionId/inputActions，也用 ref 规避闭包过期。
-  const gateRef = useRef<{ paused: boolean; release: () => void }>({ paused: false, release: () => {} })
+  // capture 处理器要读最新 rpc/sessionId/inputActions，也用 ref 规避闭包过期。
+  const gateRef = useRef<{ release: () => void }>({ release: () => {} })
   // 放行中的重复 Enter 或连点不再发起第二次上传，避免同一批图片被提交两次。
   const releasingRef = useRef(false)
   gateRef.current = {
-    paused,
     release: () => {
       if (releasingRef.current) return
       releasingRef.current = true
@@ -187,25 +230,62 @@ export const PauseControl = memo(function PauseControl({
     },
   }
 
-  // 轮询主机端状态。
+  // 推送链路：订阅 host 转发的 pause/status。收到任意帧（首个 status 回包会带回推
+  // 帧，充当握手探针）即确认存活；4s 内无帧则回退轮询。仅本会话的帧更新 enabled/paused。
   useEffect(() => {
+    if (remote === undefined || typeof remote.$on !== 'function') {
+      setPushLive(false)
+      return
+    }
+    let live = false
+    const dispose = remote.$on('pause/status', (payload: unknown) => {
+      live = true
+      setPushLive(true)
+      const frame = payload as PausePushPayload
+      if (frame?.sessionId === sessionId) {
+        if (typeof frame.enabled === 'boolean') setEnabled(frame.enabled)
+        if (typeof frame.paused === 'boolean') setPaused(frame.paused)
+      }
+    })
+    const timer = setTimeout(() => { if (!live) setPushLive(false) }, PUSH_HANDSHAKE_MS)
+    return () => { dispose(); clearTimeout(timer) }
+  }, [remote, sessionId])
+
+  // 回退轮询：推送链路未确认/失败时跟踪状态，链路存活后停止（零轮询）。
+  // 用自调度的 setTimeout 链而不是固定 setInterval：每次回包后按最新的 enabled
+  // 决定下一次间隔（开关关着就慢、开着就快），无需把 enabled 放进依赖里重建定时器。
+  useEffect(() => {
+    if (pushLive === true) return
     let disposed = false
-    let timer: ReturnType<typeof setInterval> | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    /** 最近一次已知的开关状态；首次回包前按「关」处理，与初始渲染一致。 */
+    let armed = false
+    const schedule = (): void => {
+      if (disposed) return
+      timer = setTimeout(() => { void poll() }, armed ? ARMED_POLL_MS : IDLE_POLL_MS)
+    }
     const poll = async (): Promise<void> => {
       const s = await fetchStatus(rpc, sessionId)
-      if (disposed || s === undefined) return
+      if (disposed) return
+      if (s === undefined) {
+        // 失败时按当前档位重试，不清状态：网络抖动不该把已知的 enabled 抹掉。
+        schedule()
+        return
+      }
+      armed = s.enabled === true
       setEnabled(s.enabled ?? false)
       setPaused(s.paused ?? false)
+      schedule()
     }
     void poll()
-    timer = setInterval(() => void poll(), 400)
     return () => {
       disposed = true
-      if (timer !== undefined) clearInterval(timer)
+      if (timer !== undefined) clearTimeout(timer)
     }
-  }, [rpc, sessionId])
+  }, [rpc, sessionId, pushLive])
 
-  // 暂停态激活 capture：document 捕获阶段抢在 Lexical 前拦裸 Enter。
+  // 只在 host 明确报 paused 时挂 capture：document 捕获阶段抢在 Lexical 前拦裸 Enter。
+  // 推送链路存活时 paused 即时、无盲窗；回退时靠 400ms 轮询兜底，盲窗最宽 400ms。
   useEffect(() => {
     if (!paused) return
     const onCapture = (event: KeyboardEvent): void => {

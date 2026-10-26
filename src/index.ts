@@ -3,11 +3,13 @@ import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_ENABLED, PauseRegistry, textToMessage } from './controller.ts'
+import { installForwardedEvent } from './forwarded-events.ts'
 import { mountRpcChannel, type RpcChannelHandler, type RpcChannelResult } from './rpc-channel.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
     'agent/pre-step'(this: never, payload: PreStepPayload, next: () => Promise<PreStepDecision>): Promise<PreStepDecision>
+    'pause/status'(payload: { sessionId: string; enabled: boolean; paused: boolean }): void
   }
 }
 
@@ -110,9 +112,27 @@ async function buildReleaseMessage(ctx: Context, textRaw: unknown, imagesRaw: un
   return createUserMessage({ content: content as ContentBlock[], source: { kind: 'user' } })
 }
 
+// 注入转发 allowlist 必须发生在 `@deepseek-ai/dsh-api-remotes` 的 apply 之前：
+// 它在 apply 里就 `source(signal)` 一次性 map 出全部转发监听（registerRemoteEvents
+// 内部立刻建流），之后即使再 push 也不会补上监听，只有模块求值阶段（早于所有
+// 插件的 apply）追加才有效。apply 里再调一次只是幂等兜底：若 api-remotes 反而
+// 晚于本插件装配，那次 map 会读到已追加的条目。
+installForwardedEvent()
+
 export function apply(ctx: Context, config: Config = {}): void {
   const defaultEnabled = config.defaultEnabled === true
   const registry = new PauseRegistry(defaultEnabled)
+
+  // 幂等兜底已由模块求值阶段完成；这里再调一次不会重复追加。
+  installForwardedEvent()
+
+  // 通过 $events 推送当前会话暂停状态（经上面注入的转发 allowlist）。
+  // 注入失败时 emit 无接收者，客户端收不到帧，回退到轮询。
+  const emitStatus = (sessionId: string): void => {
+    try {
+      ctx.emit('pause/status', { sessionId, enabled: registry.enabled(sessionId), paused: registry.isPaused(sessionId) })
+    } catch { /* 推送失败不影响门控 */ }
+  }
 
   const handler: RpcChannelHandler = async (endpoint, payload) => {
     try {
@@ -123,6 +143,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           registry.setEnabled(sessionId, enabled)
           // 关闭开关时应放行任何正挂着的门，避免 driver 卡在暂停态无法前进。
           if (!enabled && registry.isPaused(sessionId)) registry.release(sessionId, undefined)
+          emitStatus(sessionId)
           return ok({ paused: registry.isPaused(sessionId) })
         }
         case 'release': {
@@ -131,11 +152,15 @@ export function apply(ctx: Context, config: Config = {}): void {
           // 没有门时直接返回，避免白存图片留下无主附件。
           if (!registry.isPaused(sessionId)) return ok({ released: false })
           const message = await buildReleaseMessage(ctx, text, images)
-          return ok({ released: registry.release(sessionId, message) })
+          const released = registry.release(sessionId, message)
+          emitStatus(sessionId)
+          return ok({ released })
         }
         case 'status': {
           const { sessionId } = payload as StatusBody
           if (typeof sessionId !== 'string') return rpcError('status requires sessionId:string')
+          // 回推一帧：客户端订阅后首次 status 即确认推送链路存活，随后停止轮询。
+          emitStatus(sessionId)
           return ok({ enabled: registry.enabled(sessionId), paused: registry.isPaused(sessionId) })
         }
         default: return rpcError('unknown endpoint ' + endpoint)
@@ -156,8 +181,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     let rejectGate: (reason: unknown) => void = () => {}
     const gate = new Promise<UserMessage | undefined>((resolve, reject) => { resolveGate = resolve; rejectGate = reject })
     registry.armGate(sessionId, { resolve: resolveGate, reject: rejectGate })
+    emitStatus(sessionId)
 
-    const onAbort = (): void => { registry.abortGate(sessionId, payload.signal.reason) }
+    const onAbort = (): void => { registry.abortGate(sessionId, payload.signal.reason); emitStatus(sessionId) }
     if (payload.signal.aborted) onAbort()
     else payload.signal.addEventListener('abort', onAbort, { once: true })
 

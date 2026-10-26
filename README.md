@@ -82,6 +82,9 @@ dsh 把一次模型请求当作一个 step，agent 连续调用工具时会经�
 - 暂停点设在请求真正发出之前，故无在途调用可打断。
 - 续跑判定用同一 turn 内 step 大于 1 近似，首条纯文字请求永不暂停。
 - 浏览器端经 `conversation.input.right` 槽位在 composer 工具行渲染控件。
+- **状态即时**：host 经 `$events` 通道把 `pause/status` 推给浏览器，开关与暂停状态即时到达，无常轮询；推送未建立时自动回退轮询。
+- **不改启动配置**：推送靠往 dsh 的事件转发 allowlist 里加一条规则实现，注入在插件模块求值阶段完成，装完即用、卸载不留残留。兼容 pnpm 的 hoist 布局与 npm/yarn 的扁平、嵌套布局；解析不到时静默降级为轮询，功能完整。
+- **拦截只在暂停态进行**：只有 host 报 `paused` 时才挂按键拦截，未暂停不碰按键，不影响用户配置的 `busyEnter`。
 - 带图插话由浏览器把草稿图片序列化成 base64 随放行请求上传，主机经 `attachments.admitPromptContent` 换成持久引用后与文字并入同一条 user 消息；RPC 请求体上限据此放宽到 300 MiB。
 - 因 dsh 的 composer Enter 由 InputBar 私有 keymap 处理、第三方无 hook 点，暂停态用 DOM capture 拦截裸 Enter 改走放行，不改 DSH 源码。
 - 主机侧不经 `ctx.connection.rpc.handle`：该 API 自 0.1.2 起即不可用，改为向 webServer 自注册 `/dsh-pause` 前缀路由，复用 connection 的信任判定与浏览器鉴权，信封格式与官方一致。

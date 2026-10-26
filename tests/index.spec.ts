@@ -189,6 +189,22 @@ describe('apply host wiring', () => {
     expect(rel.value.released).toBe(false)
   })
 
+  it('status 如实反映 enabled，作为客户端轮询分档的依据', async () => {
+    // 客户端按 enabled 选轮询间隔：关着用慢档（不可能拉门，没有盲窗），
+    // 开着用快档（随时可能进入 paused）。分档正确性取决于这里报得准。
+    harness(false)
+    const sid = 'tier-1'
+    const off = await rpc('status', { sessionId: sid })
+    expect(off.value.enabled).toBe(false)
+
+    const on = await rpc('setEnabled', { sessionId: sid, enabled: true })
+    expect(on.value.paused).toBe(false)
+    expect((await rpc('status', { sessionId: sid })).value.enabled).toBe(true)
+
+    await rpc('setEnabled', { sessionId: sid, enabled: false })
+    expect((await rpc('status', { sessionId: sid })).value.enabled).toBe(false)
+  })
+
   it('RPC 参数校验返回 error', async () => {
     harness(true)
     const bad = await rpc('release', { text: 'x' })
